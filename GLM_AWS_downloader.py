@@ -94,7 +94,8 @@ def download_and_read_goes16_data(bucket_name, file_key):
 bucket_name = 'noaa-goes16'
 
 # Get timestamp in the format YYYY-MM-DD HH:MM:SS
-timestamp = '2024-03-02 20:29:45.300'
+timestamp = '2024-05-03 06:35:00.000'
+
 date_time = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
 
 file_key = get_file_key(bucket_name, date_time)
@@ -103,8 +104,8 @@ print('file_key:', file_key)
 
 nc_data = download_and_read_goes16_data(bucket_name, file_key)
 
-specific_lat = 29.575
-specific_lon = -82.398
+specific_lat = 31.87347
+specific_lon = -96.6622
 tolerance = 0.5
 
 
