@@ -1,3 +1,10 @@
+import numpy as np
+import csv
+import os
+import msvcrt
+import fcntl
+from scipy.signal import find_peaks
+
 
 
 class PeakDetector:
