@@ -5,8 +5,6 @@ import msvcrt
 import fcntl
 from scipy.signal import find_peaks
 
-
-
 class PeakDetector:
 
     def __init__(self, message, static_thr, higher_ratio): #def __init__(self, message, static_thr = False, higher_ratio = False):
