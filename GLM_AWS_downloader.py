@@ -6,9 +6,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import matplotlib.dates as mdates
-import matplotlib.patches as patches
-from matplotlib.collections import PatchCollection
 import pandas as pd
+import geopandas as gpd
+import contextily as ctx
+from shapely.geometry import box, Point
+from matplotlib.collections import PatchCollection
+import matplotlib.patches as patches
+import matplotlib
+matplotlib.use('TkAgg')
 
 # ------------------ S3 Utilities ------------------
 
@@ -194,7 +199,7 @@ def plot_event_sum(event_df, target_time):
     plt.show()
 
 
-def plot_spatial_progression(event_df, lat0, lon0, tol, bucket_name, pause_time=0.05):
+def plot_spatial_progression_on_map(event_df, lat0, lon0, tol, bucket_name, pause_time=0.01):
     if event_df.empty:
         print("No events found.")
         return
@@ -205,13 +210,18 @@ def plot_spatial_progression(event_df, lat0, lon0, tol, bucket_name, pause_time=
 
     energy_min = event_df['energy'].min()
     energy_max = event_df['energy'].max()
-    dlat, dlon = estimate_glm_pixel_deg(lat0, lon0, bucket_name)
-    cmap = plt.cm.viridis
+    dlat, dlon = 0.08, 0.084
+    cmap = plt.cm.inferno
     norm = plt.Normalize(vmin=energy_min, vmax=energy_max)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    # Prepare transformation to Web Mercator
+    def project_to_3857(lat, lon):
+        point = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(epsg=3857).geometry[0]
+        return point.x, point.y
+
+    fig, ax = plt.subplots(figsize=(10, 10))
     pc = PatchCollection([], cmap=cmap, norm=norm, edgecolor='none')
-    fig.colorbar(pc, ax=ax, label='Event Energy (J)')  # Create colorbar once
+    fig.colorbar(pc, ax=ax, label='Event Energy (J)')  # colorbar once
 
     for current_time in unique_times:
         ax.clear()
@@ -221,28 +231,38 @@ def plot_spatial_progression(event_df, lat0, lon0, tol, bucket_name, pause_time=
 
         for _, row in events_at_time.iterrows():
             lat, lon, e = row['lat'], row['lon'], row['energy']
-            rect = patches.Rectangle((lon - dlon/2, lat - dlat/2), dlon, dlat)
+            x, y = project_to_3857(lat, lon)
+            dx, dy = project_to_3857(lat + dlat / 2, lon + dlon / 2)
+            dx -= x
+            dy -= y
+            rect = patches.Rectangle((x - dx, y - dy), 2 * dx, 2 * dy)
             patches_list.append(rect)
             colors.append(e)
 
         if patches_list:
-            pc = PatchCollection(patches_list, cmap=cmap, norm=norm, edgecolor='none')
+            pc = PatchCollection(patches_list, cmap=cmap, norm=norm, edgecolor='none', alpha=0.5)
             pc.set_array(np.array(colors))
             ax.add_collection(pc)
 
-        # Reference marker and layout
-        ax.plot(lon0, lat0, marker='*', color='red', markersize=15, label='Reference Location')
-        ax.set_xlim(lon0 - 2*tol, lon0 + 2*tol)
-        ax.set_ylim(lat0 - 2*tol, lat0 + 2*tol)
-        ax.set_xlabel('Longitude')
-        ax.set_ylabel('Latitude')
-        ax.set_title(f'GLM Event Energy Footprints\nTime: {current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}')
-        ax.grid(True)
+        # Reference location
+        x0, y0 = project_to_3857(lat0, lon0)
+        ax.plot(x0, y0, marker='*', color='red', markersize=15, label='Reference Location')
+
+        # Set bounds based on projected region
+        buffer_m = 2 * 111000 * tol  # rough degrees to meters
+        ax.set_xlim(x0 - buffer_m, x0 + buffer_m)
+        ax.set_ylim(y0 - buffer_m, y0 + buffer_m)
+
+        # Add map
+        ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857")
+
+        ax.set_title(f'GLM Energy on Map\nTime: {current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}')
         ax.legend()
         plt.tight_layout()
         plt.pause(pause_time)
-
+    plt.show(block=True) 
     plt.close()
+
 
 def plot_group_progression(group_df, lat0, lon0, tol, pause_time=0.1):
     if group_df.empty:
@@ -339,7 +359,7 @@ if __name__ == "__main__":
     date_time = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
     specific_lat, specific_lon = 29.71028, -82.30736
     tolerance = 0.2
-    time_window_sec = 2
+    time_window_sec = 1
 
     file_key = get_file_key(bucket_name, date_time)
     print('file_key:', file_key)
@@ -359,7 +379,7 @@ if __name__ == "__main__":
         #plot_energy_series(event, group, flash, target_time)
         #plot_group_line(group, target_time)
         #plot_event_sum(event, target_time)
-        plot_spatial_progression(event, specific_lat, specific_lon, tolerance, bucket_name)
+        plot_spatial_progression_on_map(event, specific_lat, specific_lon, tolerance, bucket_name)
         #plot_group_progression(group, specific_lat, specific_lon, tolerance)
         #plot_all_groups(group, specific_lat, specific_lon, tolerance)
         nc_data.close()
