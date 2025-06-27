@@ -8,6 +8,7 @@ from collections import defaultdict
 import matplotlib.dates as mdates
 import matplotlib.patches as patches
 from matplotlib.collections import PatchCollection
+import pandas as pd
 
 # ------------------ S3 Utilities ------------------
 
@@ -63,116 +64,271 @@ def download_and_read_goes_data(bucket_name, file_key):
 # ------------------ Processing ------------------
 
 def estimate_glm_pixel_deg(lat, lon, bucket_name):
+    # Determine satellite longitude (GOES-16 or GOES-18)
     sat_lon = -75.0 if 'goes16' in bucket_name.lower() else -137.0
-    def haversine(lat1, lon1, lat2, lon2):
-        R = 6371
-        phi1, phi2 = np.radians(lat1), np.radians(lat2)
-        dphi = np.radians(lat2 - lat1)
-        dlambda = np.radians(lon2 - lon1)
-        a = np.sin(dphi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(dlambda/2)**2
-        return 2 * R * np.arcsin(np.sqrt(a))
-    distance_km = haversine(0.0, sat_lon, lat, lon)
-    pixel_km = np.clip(8.0 + (distance_km / 5000) * (14.0 - 8.0), 8.0, 14.0)
-    return pixel_km / 111.0, pixel_km / (111.0 * np.cos(np.radians(lat)))
+
+    # Approximate Earth radius and pixel size
+    R_earth_km = 6371.0
+    glm_pixel_km = 10.0  # Fixed conservative estimate
+
+    # Convert km to degrees latitude
+    dlat = glm_pixel_km / 110.574  # degrees per km latitude
+
+    # Convert km to degrees longitude (account for latitude)
+    dlon = glm_pixel_km / (111.320 * np.cos(np.radians(lat)))
+
+    return dlat, dlon
+
+
+
+def extract_filtered_flash_data(nc_data, start_time, target_time, lat0, lon0, tol, time_win):
+    lat = nc_data.variables['flash_lat'][:]
+    lon = nc_data.variables['flash_lon'][:]
+    energy = nc_data.variables['flash_energy'][:]
+    offsets = nc_data.variables['flash_time_offset_of_first_event'][:]
+
+    abs_times = np.array([start_time + datetime.timedelta(seconds=float(t)) for t in offsets])
+    
+    indices = [
+        i for i in range(len(lat))
+        if abs(lat[i] - lat0) <= tol and abs(lon[i] - lon0) <= tol and
+        abs((abs_times[i] - target_time).total_seconds()) <= time_win
+    ]
+
+    data = {
+        'time': [abs_times[i] for i in indices],
+        'lat': [lat[i] for i in indices],
+        'lon': [lon[i] for i in indices],
+        'energy': [energy[i] for i in indices],
+    }
+    return pd.DataFrame(data)
+
 
 def extract_filtered_data(nc_data, var_prefix, start_time, target_time, lat0, lon0, tol, time_win):
     lat = nc_data.variables[f'{var_prefix}_lat'][:]
     lon = nc_data.variables[f'{var_prefix}_lon'][:]
     energy = nc_data.variables[f'{var_prefix}_energy'][:]
     offsets = nc_data.variables[f'{var_prefix}_time_offset'][:]
+    
     abs_times = np.array([start_time + datetime.timedelta(seconds=float(t)) for t in offsets])
+
     indices = [
         i for i in range(len(lat))
-        if abs(lat[i] - lat0) <= tol and abs(lon[i] - lon0) <= tol and
-        abs((abs_times[i] - target_time).total_seconds()) <= time_win
+        if abs(lat[i] - lat0) <= tol and
+           abs(lon[i] - lon0) <= tol and
+           abs((abs_times[i] - target_time).total_seconds()) <= time_win
     ]
-    return [abs_times[i] for i in indices], [energy[i] for i in indices]
+
+    data = {
+        'time': [abs_times[i] for i in indices],
+        'energy': [energy[i] for i in indices],
+        'lat': [lat[i] for i in indices],
+        'lon': [lon[i] for i in indices],
+        'type': [var_prefix] * len(indices)
+    }
+
+    return pd.DataFrame(data)
 
 # ------------------ Plotting ------------------
 
-def plot_energy_series(event, group, flash, target_time):
-    plt.figure(figsize=(12, 6))
-    plt.plot(*event, 'o', label='Event Energy', color='blue')
-    plt.plot(*group, 'x', label='Group Energy', color='green')
-    plt.plot(*flash, '^', label='Flash Energy', color='red')
-    plt.axvline(target_time, color='black', linestyle='--', label='Target Time')
-    plt.xlabel('Time (UTC)')
-    plt.ylabel('Optical Energy (Joules)')
-    plt.title('GLM Optical Energy near Target Location and Time')
-    plt.legend()
-    plt.grid(True)
+def plot_energy_series(event_df, group_df, flash_df, target_time):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Plot each dataset with a unique marker and label
+    if not event_df.empty:
+        ax.scatter(event_df['time'], event_df['energy'], label='Events', color='red', s=20, alpha=0.6)
+    if not group_df.empty:
+        ax.scatter(group_df['time'], group_df['energy'], label='Groups', color='blue', s=30, alpha=0.6, marker='x')
+    if not flash_df.empty:
+        ax.scatter(flash_df['time'], flash_df['energy'], label='Flashes', color='green', s=50, alpha=0.6, marker='^')
+
+    # Format plot
+    ax.axvline(target_time, color='black', linestyle='--', label='Target Time')
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Energy (Joules)")
+    ax.set_title("GLM Energy Time Series")
+    ax.legend()
+    ax.grid(True)
     plt.tight_layout()
     plt.show()
 
-def plot_group_line(group, target_time):
-    if group[0] and group[1]:
-        idx = np.argsort(group[0])
-        sorted_times = [group[0][i] for i in idx]
-        sorted_energies = [group[1][i] for i in idx]
-        plt.figure(figsize=(12, 4))
-        plt.plot(sorted_times, sorted_energies, 'o', color='green', label='Group Energy')
-        plt.axvline(target_time, color='black', linestyle='--', label='Target Time')
-        plt.xlabel('Time (UTC)')
-        plt.ylabel('Group Optical Energy (Joules)')
-        plt.title('Group Energy Over Time Near Target')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
+def plot_group_line(group_df, target_time):
+    if group_df.empty:
+        print("No group data available for line plot.")
+        return
 
-def plot_event_sum(event, target_time):
-    if event[0] and event[1]:
-        energy_by_time = defaultdict(float)
-        for t, e in zip(event[0], event[1]):
-            energy_by_time[t] += e
-        times = sorted(energy_by_time.keys())
-        energies = [energy_by_time[t] for t in times]
-        plt.figure(figsize=(12, 4))
-        plt.plot(times, energies, 'o', color='blue', label='Event Energy integrated')
-        plt.axvline(target_time, color='black', linestyle='--', label='Target Time')
-        plt.xlabel('Time (UTC)')
-        plt.ylabel('Integrated Event Energy (Joules)')
-        plt.title('Integrated Event Energy near Target')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
+    # Sort by time for proper line plotting
+    group_df = group_df.sort_values('time')
 
-def plot_spatial(nc_data, lat0, lon0, tol, bucket_name):
-    lats = nc_data.variables['event_lat'][:]
-    lons = nc_data.variables['event_lon'][:]
-    energies = nc_data.variables['event_energy'][:]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(group_df['time'], group_df['energy'], color='blue', marker='o', linestyle='-')
+    ax.axvline(target_time, color='black', linestyle='--', label='Target Time')
+
+    # Labels and formatting
+    ax.set_title("Group Energy vs Time")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Energy (Joules)")
+    ax.grid(True)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+def plot_event_sum(event_df, target_time):
+    if event_df.empty:
+        print("No event data available for sum plot.")
+        return
+
+    # Sum energy for exactly matching times
+    energy_sum = event_df.groupby('time')['energy'].sum().sort_index()
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(energy_sum.index, energy_sum.values, 'o', color='blue', label='Event Energy integrated')
+    ax.axvline(target_time, color='black', linestyle='--', label='Target Time')
+
+    ax.set_xlabel('Time (UTC)')
+    ax.set_ylabel('Integrated Event Energy (Joules)')
+    ax.set_title('Integrated Event Energy near Target')
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_spatial_progression(event_df, lat0, lon0, tol, bucket_name, pause_time=0.05):
+    if event_df.empty:
+        print("No events found.")
+        return
+
+    event_df = event_df.copy()
+    event_df.sort_values('time', inplace=True)
+    unique_times = sorted(event_df['time'].unique())
+
+    energy_min = event_df['energy'].min()
+    energy_max = event_df['energy'].max()
     dlat, dlon = estimate_glm_pixel_deg(lat0, lon0, bucket_name)
+    cmap = plt.cm.viridis
+    norm = plt.Normalize(vmin=energy_min, vmax=energy_max)
 
     fig, ax = plt.subplots(figsize=(10, 8))
-    patches_list, colors = [], []
+    pc = PatchCollection([], cmap=cmap, norm=norm, edgecolor='none')
+    fig.colorbar(pc, ax=ax, label='Event Energy (J)')  # Create colorbar once
 
-    for lat, lon, e in zip(lats, lons, energies):
-        if abs(lat - lat0) <= tol and abs(lon - lon0) <= tol:
+    for current_time in unique_times:
+        ax.clear()
+        patches_list, colors = [], []
+
+        events_at_time = event_df[event_df['time'] == current_time]
+
+        for _, row in events_at_time.iterrows():
+            lat, lon, e = row['lat'], row['lon'], row['energy']
             rect = patches.Rectangle((lon - dlon/2, lat - dlat/2), dlon, dlat)
             patches_list.append(rect)
             colors.append(e)
 
-    if patches_list:
-        pc = PatchCollection(patches_list, cmap='hot', edgecolor='none')
-        pc.set_array(np.array(colors))
-        ax.add_collection(pc)
-        plt.colorbar(pc, ax=ax, label='Event Energy (J)')
+        if patches_list:
+            pc = PatchCollection(patches_list, cmap=cmap, norm=norm, edgecolor='none')
+            pc.set_array(np.array(colors))
+            ax.add_collection(pc)
 
-        # 🔴 Add marker for reference location
+        # Reference marker and layout
+        ax.plot(lon0, lat0, marker='*', color='red', markersize=15, label='Reference Location')
+        ax.set_xlim(lon0 - 2*tol, lon0 + 2*tol)
+        ax.set_ylim(lat0 - 2*tol, lat0 + 2*tol)
+        ax.set_xlabel('Longitude')
+        ax.set_ylabel('Latitude')
+        ax.set_title(f'GLM Event Energy Footprints\nTime: {current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}')
+        ax.grid(True)
+        ax.legend()
+        plt.tight_layout()
+        plt.pause(pause_time)
+
+    plt.close()
+
+def plot_group_progression(group_df, lat0, lon0, tol, pause_time=0.1):
+    if group_df.empty:
+        print("No groups found.")
+        return
+
+    group_df = group_df.copy()
+    group_df.sort_values('time', inplace=True)
+    unique_times = sorted(group_df['time'].unique())
+
+    energy_min = group_df['energy'].min()
+    energy_max = group_df['energy'].max()
+    cmap = plt.cm.viridis
+    norm = plt.Normalize(vmin=energy_min, vmax=energy_max)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sc = ax.scatter([], [], c=[], cmap=cmap, norm=norm)
+    cbar = fig.colorbar(sc, ax=ax, label='Group Energy (J)')
+
+    for current_time in unique_times:
+        ax.clear()
+
+        groups_at_time = group_df[group_df['time'] == current_time]
+        lats = groups_at_time['lat'].values
+        lons = groups_at_time['lon'].values
+        energies = groups_at_time['energy'].values
+
+        scatter = ax.scatter(lons, lats, c=energies, cmap=cmap, norm=norm, s=50, edgecolor='black')
+
+        # Reference marker
         ax.plot(lon0, lat0, marker='*', color='red', markersize=15, label='Reference Location')
 
         ax.set_xlim(lon0 - 2*tol, lon0 + 2*tol)
         ax.set_ylim(lat0 - 2*tol, lat0 + 2*tol)
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
-        ax.set_title('GLM Event Energy Footprints')
+        ax.set_title(f'GLM Group Centroids\nTime: {current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}')
         ax.grid(True)
         ax.legend()
         plt.tight_layout()
-        plt.show()
-    else:
-        print("No events found for spatial plot.")
+        plt.pause(pause_time)
+
+    plt.close()
+
+def plot_all_groups(group_df, lat0, lon0, tol):
+    if group_df.empty:
+        print("No groups found.")
+        return
+
+    group_df = group_df.copy()
+
+    # Filter by spatial tolerance (if needed)
+    group_df = group_df[
+        (np.abs(group_df['lat'] - lat0) <= tol) &
+        (np.abs(group_df['lon'] - lon0) <= tol)
+    ]
+
+    if group_df.empty:
+        print("No groups within specified tolerance.")
+        return
+
+    energy_min = group_df['energy'].min()
+    energy_max = group_df['energy'].max()
+    cmap = plt.cm.viridis
+    norm = plt.Normalize(vmin=energy_min, vmax=energy_max)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    lats = group_df['lat'].values
+    lons = group_df['lon'].values
+    energies = group_df['energy'].values
+
+    sc = ax.scatter(lons, lats, c=energies, cmap=cmap, norm=norm, s=50, edgecolor='black')
+    fig.colorbar(sc, ax=ax, label='Group Energy (J)')
+
+    ax.plot(lon0, lat0, marker='*', color='red', markersize=15, label='Reference Location')
+
+    ax.set_xlim(lon0 - 2*tol, lon0 + 2*tol)
+    ax.set_ylim(lat0 - 2*tol, lat0 + 2*tol)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.set_title('All GLM Group Centroids')
+    ax.grid(True)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 # ------------------ MAIN EXECUTION ------------------
@@ -183,7 +339,7 @@ if __name__ == "__main__":
     date_time = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
     specific_lat, specific_lon = 29.71028, -82.30736
     tolerance = 0.2
-    time_window_sec = 20
+    time_window_sec = 2
 
     file_key = get_file_key(bucket_name, date_time)
     print('file_key:', file_key)
@@ -197,25 +353,15 @@ if __name__ == "__main__":
 
         event = extract_filtered_data(nc_data, 'event', start_time, target_time, specific_lat, specific_lon, tolerance, time_window_sec)
         group = extract_filtered_data(nc_data, 'group', start_time, target_time, specific_lat, specific_lon, tolerance, time_window_sec)
+        flash = extract_filtered_flash_data(nc_data, start_time, target_time, specific_lat, specific_lon, tolerance, time_window_sec)
 
-        flash_lat = nc_data.variables['flash_lat'][:]
-        flash_lon = nc_data.variables['flash_lon'][:]
-        flash_energy = nc_data.variables['flash_energy'][:]
-        flash_offsets = nc_data.variables['flash_time_offset_of_first_event'][:]
-        flash_times = np.array([start_time + datetime.timedelta(seconds=float(t)) for t in flash_offsets])
-        flash_indices = [
-            i for i in range(len(flash_lat))
-            if abs(flash_lat[i] - specific_lat) <= tolerance and
-               abs(flash_lon[i] - specific_lon) <= tolerance and
-               abs((flash_times[i] - target_time).total_seconds()) <= time_window_sec
-        ]
-        flash = ([flash_times[i] for i in flash_indices], [flash_energy[i] for i in flash_indices])
 
-        plot_energy_series(event, group, flash, target_time)
-        plot_group_line(group, target_time)
-        plot_event_sum(event, target_time)
-        plot_spatial(nc_data, specific_lat, specific_lon, tolerance, bucket_name)
-
+        #plot_energy_series(event, group, flash, target_time)
+        #plot_group_line(group, target_time)
+        #plot_event_sum(event, target_time)
+        plot_spatial_progression(event, specific_lat, specific_lon, tolerance, bucket_name)
+        #plot_group_progression(group, specific_lat, specific_lon, tolerance)
+        #plot_all_groups(group, specific_lat, specific_lon, tolerance)
         nc_data.close()
     else:
         print("Failed to load data.")
