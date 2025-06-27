@@ -10,6 +10,7 @@ import pandas as pd
 import geopandas as gpd
 import contextily as ctx
 from shapely.geometry import box, Point
+from matplotlib.patches import Rectangle
 from matplotlib.collections import PatchCollection
 import matplotlib.patches as patches
 import matplotlib
@@ -177,7 +178,93 @@ def plot_group_line(group_df, target_time):
     ax.legend()
     plt.tight_layout()
     plt.show()
+    
+def plot_combined_spatial_and_energy(event_df, lat0, lon0, tol, bucket_name, pause_time=0.04):
+    if event_df.empty:
+        print("No events found.")
+        return
 
+    event_df = event_df.copy()
+    event_df.sort_values('time', inplace=True)
+    unique_times = sorted(event_df['time'].unique())
+
+    energy_min = event_df['energy'].min()
+    energy_max = event_df['energy'].max()
+    dlat, dlon = 0.08, 0.084
+    cmap = plt.cm.inferno
+    norm = plt.Normalize(vmin=energy_min, vmax=energy_max)
+
+    def project_to_3857(lat, lon):
+        point = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(epsg=3857).geometry[0]
+        return point.x, point.y
+
+    # Precompute cumulative energy sums grouped by time for time series subplot
+    energy_sum = event_df.groupby('time')['energy'].sum().sort_index()
+    times_sorted = energy_sum.index.to_list()
+    integrated_energy_max = energy_sum.max()
+
+    fig, (ax_map, ax_ts) = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Initialize colorbar once for map subplot
+    pc_dummy = PatchCollection([], cmap=cmap, norm=norm, edgecolor='none', alpha=0.5)
+    cbar = fig.colorbar(pc_dummy, ax=ax_map, label='Event Energy (J)')
+    
+    x0, y0 = project_to_3857(lat0, lon0)
+    buffer_m = 2 * 111000 * tol  # rough degrees to meters
+
+    for current_time in unique_times:
+        # --- Spatial subplot ---
+        ax_map.clear()
+        patches_list, colors = [], []
+
+        events_at_time = event_df[event_df['time'] == current_time]
+
+        for _, row in events_at_time.iterrows():
+            lat, lon, e = row['lat'], row['lon'], row['energy']
+            x, y = project_to_3857(lat, lon)
+            dx, dy = project_to_3857(lat + dlat / 2, lon + dlon / 2)
+            dx -= x
+            dy -= y
+            rect = Rectangle((x - dx, y - dy), 2 * dx, 2 * dy)
+            patches_list.append(rect)
+            colors.append(e)
+
+        if patches_list:
+            pc = PatchCollection(patches_list, cmap=cmap, norm=norm, edgecolor='none', alpha=0.5)
+            pc.set_array(np.array(colors))
+            ax_map.add_collection(pc)
+
+        # Reference location
+        ax_map.plot(x0, y0, marker='*', color='red', markersize=15, label='Reference Location')
+        ax_map.set_xlim(x0 - buffer_m, x0 + buffer_m)
+        ax_map.set_ylim(y0 - buffer_m, y0 + buffer_m)
+        ctx.add_basemap(ax_map, source=ctx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857")
+
+        ax_map.set_title(f'GLM Energy on Map\nTime: {current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}')
+        ax_map.legend()
+
+        # --- Time series subplot ---
+        ax_ts.clear()
+
+        # Select all times <= current_time for cumulative plot
+        idx = [t <= current_time for t in times_sorted]
+        ax_ts.set_ylim(0, integrated_energy_max*1.1)
+        ax_ts.plot(energy_sum.index, energy_sum.values, '--', color='blue', label='Cumulative Integrated Energy')
+        ax_ts.axvline(current_time, color='black', linestyle='--', label='Current Time')
+
+        # Set fixed vertical scale
+        ax_ts.set_xlabel('Time (UTC)')
+        ax_ts.set_ylabel('Cumulative Integrated Event Energy (Joules)')
+        ax_ts.set_title('Integrated Event Energy over Time')
+        ax_ts.legend()
+        ax_ts.grid(True)
+        fig.autofmt_xdate()
+
+        plt.tight_layout()
+        plt.pause(pause_time)
+
+    plt.show()
+    
 def plot_event_sum(event_df, target_time):
     if event_df.empty:
         print("No event data available for sum plot.")
@@ -351,6 +438,113 @@ def plot_all_groups(group_df, lat0, lon0, tol):
     plt.show()
 
 
+from matplotlib.animation import FuncAnimation
+def plot_and_save_video(event_df, lat0, lon0, tol, bucket_name, filename='glm_energy_animation.mp4', fps=8):
+    if event_df.empty:
+        print("No events found.")
+        return
+
+    event_df = event_df.copy()
+    event_df.sort_values('time', inplace=True)
+    unique_times = sorted(event_df['time'].unique())
+
+    energy_min = event_df['energy'].min()
+    energy_max = event_df['energy'].max()
+    dlat, dlon = 0.08, 0.084
+    cmap = plt.cm.inferno
+    norm = plt.Normalize(vmin=energy_min, vmax=energy_max)
+
+    def project_to_3857(lat, lon):
+        point = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(epsg=3857).geometry[0]
+        return point.x, point.y
+
+    energy_sum = event_df.groupby('time')['energy'].sum().sort_index()
+    integrated_energy_max = energy_sum.max()
+
+    fig, (ax_map, ax_ts) = plt.subplots(1, 2, figsize=(18, 10))
+
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.9)
+
+    pc_dummy = PatchCollection([], cmap=cmap, norm=norm, edgecolor='none', alpha=0.5)
+    cbar = fig.colorbar(pc_dummy, ax=ax_map, label='Event Energy (J)')
+
+    x0, y0 = project_to_3857(lat0, lon0)
+    buffer_m = 2 * 111000 * tol
+
+    # We'll keep references to artists to update them instead of clearing all the time
+    patches_list = []
+    pc = None
+
+    ref_loc_plot, = ax_map.plot(x0, y0, marker='*', color='red', markersize=15, label='Reference Location')
+    ax_map.set_xlim(x0 - buffer_m, x0 + buffer_m)
+    ax_map.set_ylim(y0 - buffer_m, y0 + buffer_m)
+    ctx.add_basemap(ax_map, source=ctx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857")
+
+    ax_map.set_title('')
+    ax_map.legend()
+
+    ax_ts.set_ylim(0, integrated_energy_max * 1.1)
+    ax_ts.set_xlabel('Time (UTC)')
+    ax_ts.set_ylabel('Cumulative Integrated Event Energy (Joules)')
+    ax_ts.set_title('Integrated Event Energy over Time')
+    ax_ts.grid(True)
+
+    vertical_line = ax_ts.axvline(unique_times[0], color='black', linestyle='--', label='Current Time')
+    time_series_line, = ax_ts.plot([], [], '-', color='blue', label='Cumulative Integrated Energy')
+
+    ax_ts.legend()
+    fig.autofmt_xdate()
+
+    def update(frame_idx):
+        current_time = unique_times[frame_idx]
+        for coll in ax_map.collections:
+            coll.remove()
+
+        events_at_time = event_df[event_df['time'] == current_time]
+
+        patches_list = []
+        colors = []
+
+        for _, row in events_at_time.iterrows():
+            lat, lon, e = row['lat'], row['lon'], row['energy']
+            x, y = project_to_3857(lat, lon)
+            dx, dy = project_to_3857(lat + dlat / 2, lon + dlon / 2)
+            dx -= x
+            dy -= y
+            rect = Rectangle((x - dx, y - dy), 2 * dx, 2 * dy)
+            patches_list.append(rect)
+            colors.append(e)
+
+        if patches_list:
+            pc = PatchCollection(patches_list, cmap=cmap, norm=norm, edgecolor='none', alpha=0.5)
+            pc.set_array(np.array(colors))
+            ax_map.add_collection(pc)
+
+        ax_map.set_title(f'GLM Energy on Map\nTime: {current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}')
+        ax_map.legend()
+
+        # Update time series subplot
+        idx = [t <= current_time for t in energy_sum.index]
+        
+        times_to_plot = np.array(energy_sum.index)[idx]
+        values_to_plot = np.array(energy_sum.values)[idx]
+        time_series_line.set_data(times_to_plot, values_to_plot)
+        vertical_line.set_xdata(current_time)
+
+        ax_ts.set_xlim(times_to_plot[0], times_to_plot[-1])
+
+        return ax_map.collections + [ref_loc_plot, time_series_line, vertical_line]
+
+    ani = FuncAnimation(fig, update, frames=len(unique_times), blit=False, repeat=False)
+
+    # Save as video mp4 using ffmpeg writer
+    print(f"Saving animation to {filename} ...")
+    ani.save(filename, writer='ffmpeg', fps=fps, dpi=150)
+    print("Save complete.")
+
+    plt.close(fig)
+
 # ------------------ MAIN EXECUTION ------------------
 
 if __name__ == "__main__":
@@ -359,7 +553,7 @@ if __name__ == "__main__":
     date_time = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
     specific_lat, specific_lon = 29.71028, -82.30736
     tolerance = 0.2
-    time_window_sec = 1
+    time_window_sec = 0.4
 
     file_key = get_file_key(bucket_name, date_time)
     print('file_key:', file_key)
@@ -379,7 +573,10 @@ if __name__ == "__main__":
         #plot_energy_series(event, group, flash, target_time)
         #plot_group_line(group, target_time)
         #plot_event_sum(event, target_time)
-        plot_spatial_progression_on_map(event, specific_lat, specific_lon, tolerance, bucket_name)
+        #plot_spatial_progression_on_map(event, specific_lat, specific_lon, tolerance, bucket_name)
+        #plot_combined_spatial_and_energy(event, specific_lat, specific_lon, tolerance, bucket_name)
+        plot_and_save_video(event, specific_lat, specific_lon, tolerance, bucket_name, filename='glm_energy_animation.mp4', fps=8)
+
         #plot_group_progression(group, specific_lat, specific_lon, tolerance)
         #plot_all_groups(group, specific_lat, specific_lon, tolerance)
         nc_data.close()
